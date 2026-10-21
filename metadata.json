@@ -1,0 +1,6 @@
+{
+  "name": "شاشة عرض رسائل الهاتف ومحفظة جيب",
+  "description": "برنامج مخصص لشاشة الكمبيوتر لعرض الرسائل والإشعارات الواردة من الهاتف فور وصولها مع التنبيه الصوتي.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
