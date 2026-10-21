@@ -2,8 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   MessageSquare, 
   Smartphone, 
-  Volume2, 
-  VolumeX, 
   Trash2, 
   Copy, 
   Check, 
@@ -12,19 +10,14 @@ import {
   CheckCircle2, 
   X,
   History,
-  Download,
-  Calendar,
-  DollarSign
+  Download
 } from 'lucide-react';
 import QRCode from 'qrcode';
 import { PhoneMessage } from './types';
-import { playAlertSound, speakPaymentAlert, speakMessage, triggerDesktopNotification } from './utils/audio';
 
 export default function App() {
   const [messages, setMessages] = useState<PhoneMessage[]>([]);
   const [isConnected, setIsConnected] = useState(false);
-  const [soundEnabled, setSoundEnabled] = useState(true);
-  const [speechEnabled, setSpeechEnabled] = useState(true);
   const [fontSize, setFontSize] = useState<'normal' | 'large' | 'xl'>('large');
   const [searchTerm, setSearchTerm] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -38,9 +31,6 @@ export default function App() {
   const [webhookUrl, setWebhookUrl] = useState('');
   const [qrUrl, setQrUrl] = useState('');
   const [copiedUrl, setCopiedUrl] = useState(false);
-
-  const socketRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
 
   useEffect(() => {
     const fullUrl = `${window.location.origin}/api/messages`;
@@ -58,104 +48,117 @@ export default function App() {
       .then(data => {
         if (data.messages) {
           setMessages(data.messages);
+          setIsConnected(true);
         }
       })
       .catch(console.error);
-
-    // Request desktop notification permission
-    if ('Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission().catch(() => {});
-    }
   }, []);
 
-  // WebSocket Setup
+  // Bulletproof Real-time Sync with Server-Sent Events (SSE) & WebSocket fallback
   useEffect(() => {
+    let eventSource: EventSource | null = null;
+    let ws: WebSocket | null = null;
     let isMounted = true;
 
-    const connect = () => {
+    // 1. Primary Real-Time Channel: EventSource (SSE) - 100% reliable across Cloud Run / proxies
+    try {
+      eventSource = new EventSource('/api/events');
+
+      eventSource.onopen = () => {
+        if (isMounted) setIsConnected(true);
+      };
+
+      eventSource.onmessage = (e) => {
+        if (!isMounted) return;
+        try {
+          const payload = JSON.parse(e.data);
+          handleRealtimeEvent(payload);
+        } catch {
+          // ignore
+        }
+      };
+
+      eventSource.onerror = () => {
+        // SSE will automatically try to reconnect; fallback to polling if needed
+        if (isMounted) setIsConnected(false);
+      };
+    } catch (err) {
+      console.warn('SSE fallback to polling/WS');
+    }
+
+    // 2. Secondary WebSocket check without throwing unhandled exceptions
+    try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}`;
+      ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
-      try {
-        const ws = new WebSocket(wsUrl);
-        socketRef.current = ws;
+      ws.onopen = () => {
+        if (isMounted) setIsConnected(true);
+      };
 
-        ws.onopen = () => {
-          if (!isMounted) return;
-          setIsConnected(true);
-        };
+      ws.onmessage = (event) => {
+        if (!isMounted) return;
+        try {
+          const payload = JSON.parse(event.data);
+          handleRealtimeEvent(payload);
+        } catch {
+          // ignore
+        }
+      };
 
-        ws.onmessage = (event) => {
-          if (!isMounted) return;
-          try {
-            const payload = JSON.parse(event.data);
-            if (payload.event === 'init' && payload.data?.messages) {
-              setMessages(payload.data.messages);
-            } else if (payload.event === 'message:new' && payload.data) {
-              const newMsg: PhoneMessage = payload.data;
-              setMessages(prev => {
-                if (prev.some(m => m.id === newMsg.id)) return prev;
-                return [newMsg, ...prev];
-              });
+      ws.onerror = () => {
+        // Suppress websocket errors silently
+      };
 
-              // Play audio chime
-              if (soundEnabled) {
-                playAlertSound('cash_register');
-              }
+      ws.onclose = () => {
+        // Suppress
+      };
+    } catch {
+      // ignore
+    }
 
-              // Speak announcement
-              if (speechEnabled) {
-                if (newMsg.isPayment && newMsg.amount) {
-                  speakPaymentAlert(newMsg.amount, newMsg.senderName || 'الزبون', newMsg.currency || 'ريال');
-                } else {
-                  speakMessage(`رسالة جديدة من ${newMsg.sender}: ${newMsg.text.slice(0, 70)}`);
-                }
-              }
-
-              // Desktop notification
-              triggerDesktopNotification(
-                `رسالة من: ${newMsg.sender}`,
-                newMsg.text
-              );
-            } else if (payload.event === 'messages:cleared') {
-              setMessages([]);
-            } else if (payload.event === 'message:deleted') {
-              setMessages(prev => prev.filter(m => m.id !== payload.data?.id));
-            }
-          } catch (e) {
-            console.error('WS Error:', e);
+    // Periodic poll every 5s as a fail-safe backup
+    const pollInterval = setInterval(() => {
+      fetch('/api/messages')
+        .then(res => res.json())
+        .then(data => {
+          if (data.messages && isMounted) {
+            setMessages(data.messages);
+            setIsConnected(true);
           }
-        };
-
-        ws.onclose = () => {
-          if (!isMounted) return;
-          setIsConnected(false);
-          reconnectTimeoutRef.current = setTimeout(connect, 3000);
-        };
-
-        ws.onerror = () => {
-          ws.close();
-        };
-      } catch (err) {
-        reconnectTimeoutRef.current = setTimeout(connect, 3000);
-      }
-    };
-
-    connect();
-
-    const pingTimer = setInterval(() => {
-      if (socketRef.current?.readyState === WebSocket.OPEN) {
-        socketRef.current.send(JSON.stringify({ event: 'ping' }));
-      }
-    }, 25000);
+        })
+        .catch(() => {});
+    }, 5000);
 
     return () => {
       isMounted = false;
-      clearInterval(pingTimer);
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (socketRef.current) socketRef.current.close();
+      clearInterval(pollInterval);
+      if (eventSource) eventSource.close();
+      if (ws) {
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.close();
+      }
     };
-  }, [soundEnabled, speechEnabled]);
+  }, []);
+
+  // Handler for real-time messages
+  const handleRealtimeEvent = (payload: { event: string; data: any }) => {
+    if (payload.event === 'init' && payload.data?.messages) {
+      setMessages(payload.data.messages);
+      setIsConnected(true);
+    } else if (payload.event === 'message:new' && payload.data) {
+      const newMsg: PhoneMessage = payload.data;
+      setMessages(prev => {
+        if (prev.some(m => m.id === newMsg.id)) return prev;
+        return [newMsg, ...prev];
+      });
+      setIsConnected(true);
+    } else if (payload.event === 'messages:cleared') {
+      setMessages([]);
+    } else if (payload.event === 'message:deleted') {
+      setMessages(prev => prev.filter(m => m.id !== payload.data?.id));
+    }
+  };
 
   // Delete single message
   const handleDeleteMessage = async (id: string) => {
@@ -239,6 +242,7 @@ export default function App() {
   // Format time relative or exact
   const formatMsgTime = (isoString: string) => {
     const date = new Date(isoString);
+    if (isNaN(date.getTime())) return '';
     const now = new Date();
     const diffSeconds = Math.floor((now.getTime() - date.getTime()) / 1000);
 
@@ -282,9 +286,9 @@ export default function App() {
             </div>
           </div>
 
-          {/* Quick Toolbar */}
+          {/* Quick Toolbar (Speech and Sound buttons deleted as requested) */}
           <div className="flex items-center gap-2 shrink-0">
-            {/* زر سجل (History Button Requested by User) */}
+            {/* زر سجل */}
             <button
               onClick={() => setIsHistoryOpen(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-500 text-xs font-black transition-all shadow-md shadow-emerald-600/20"
@@ -327,33 +331,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* Sound Toggle */}
-            <button
-              onClick={() => setSoundEnabled(!soundEnabled)}
-              title={soundEnabled ? 'صوت التنبيه مفعل' : 'صوت التنبيه مكتوم'}
-              className={`p-2 rounded-xl border transition-all ${
-                soundEnabled 
-                  ? 'bg-slate-800 text-emerald-400 border-slate-700 hover:bg-slate-700' 
-                  : 'bg-slate-900 text-slate-500 border-slate-800'
-              }`}
-            >
-              {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
-            </button>
-
-            {/* Speech Toggle */}
-            <button
-              onClick={() => setSpeechEnabled(!speechEnabled)}
-              title={speechEnabled ? 'نطق الرسائل صوتياً مفعل' : 'نطق الرسائل معطل'}
-              className={`hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-bold transition-all ${
-                speechEnabled
-                  ? 'bg-teal-500/10 text-teal-300 border-teal-500/30'
-                  : 'bg-slate-900 text-slate-500 border-slate-800'
-              }`}
-            >
-              <span>🗣️</span>
-              <span>نطق</span>
-            </button>
-
             {/* How to Connect Phone Button */}
             <button
               onClick={() => setIsGuideOpen(true)}
@@ -369,7 +346,7 @@ export default function App() {
       {/* Main Messages Content */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 py-6 space-y-4">
         
-        {/* Simple & Clean Search Bar without options under it */}
+        {/* Simple & Clean Search Bar */}
         <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-2.5 flex items-center gap-3 shadow-md">
           <div className="relative flex-1">
             <Search className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2" />

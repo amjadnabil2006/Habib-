@@ -10,7 +10,20 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+// Use noServer: true so we don't interfere with Vite or other upgrades
+const wss = new WebSocketServer({ noServer: true });
+
+// CORS Support for incoming webhooks
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -23,12 +36,11 @@ if (!fs.existsSync(dataDir)) {
 }
 
 const messagesFile = path.join(dataDir, 'messages.json');
-const configFile = path.join(dataDir, 'config.json');
 
 export interface PhoneMessage {
   id: string;
-  sender: string;              // e.g. "Jeeb", "CACBank", "771234567"
-  text: string;                // Full raw text of message
+  sender: string;
+  text: string;
   timestamp: string;
   isPayment: boolean;
   amount?: number;
@@ -37,11 +49,11 @@ export interface PhoneMessage {
   senderName?: string;
 }
 
-// Initial sample messages for immediate preview
+// Initial sample messages
 let messages: PhoneMessage[] = [
   {
     id: "msg-101",
-    sender: "محفظة جيب (Jeeb)",
+    sender: "محفظة جيب",
     text: "تم استلام حوالة بمبلغ 12,500 ر.ي من حساب 771239841 (خالد عبد الله المنصوري). رقم العملية JB-98214301",
     timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
     isPayment: true,
@@ -90,27 +102,65 @@ function saveMessages() {
   }
 }
 
-// Broadcast WebSocket event
+// Convert Eastern Arabic numerals (٠-٩) to Western (0-9)
+function normalizeArabicDigits(str: string): string {
+  if (!str) return '';
+  const arabicDigits = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+  return str.replace(/[٠-٩]/g, (char) => {
+    const idx = arabicDigits.indexOf(char);
+    return idx !== -1 ? String(idx) : char;
+  });
+}
+
+// Server-Sent Events (SSE) clients set
+const sseClients = new Set<express.Response>();
+
+// Broadcast to both SSE and WebSocket clients
 function broadcast(event: string, payload: any) {
-  const message = JSON.stringify({ event, data: payload, timestamp: new Date().toISOString() });
+  const dataString = JSON.stringify({ event, data: payload, timestamp: new Date().toISOString() });
+
+  // 1. Send to SSE clients
+  sseClients.forEach((client) => {
+    try {
+      client.write(`data: ${dataString}\n\n`);
+    } catch {
+      sseClients.delete(client);
+    }
+  });
+
+  // 2. Send to WebSocket clients
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
+      try {
+        client.send(dataString);
+      } catch {
+        // ignore
+      }
     }
   });
 }
 
-// WebSocket connection
+// Handle upgrades specifically on /ws
+server.on('upgrade', (request, socket, head) => {
+  const pathname = request.url ? new URL(request.url, `http://${request.headers.host}`).pathname : '';
+  if (pathname === '/ws' || pathname === '/') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// WebSocket connection handler
 wss.on('connection', (ws: WebSocket) => {
   ws.send(JSON.stringify({
     event: 'init',
     data: {
       messages,
-      activeClients: wss.clients.size
+      activeClients: wss.clients.size + sseClients.size
     }
   }));
-
-  broadcast('clients:count', { count: wss.clients.size });
 
   ws.on('message', (data) => {
     try {
@@ -122,9 +172,35 @@ wss.on('connection', (ws: WebSocket) => {
       // ignore
     }
   });
+});
 
-  ws.on('close', () => {
-    broadcast('clients:count', { count: wss.clients.size });
+// Server-Sent Events (SSE) Endpoint - 100% reliable across all Cloud proxies
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
+  });
+
+  // Send initial data
+  res.write(`data: ${JSON.stringify({ event: 'init', data: { messages } })}\n\n`);
+
+  sseClients.add(res);
+
+  // Send keepalive comments every 15s
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(': keepalive\n\n');
+    } catch {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    }
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
   });
 });
 
@@ -136,7 +212,7 @@ export function parseMessageDetails(text: string, rawSender?: string): {
   referenceNumber?: string;
   senderName?: string;
 } {
-  const combined = text || '';
+  const combined = normalizeArabicDigits(text || '');
   
   // Amount regex
   let amount: number | undefined;
@@ -220,27 +296,31 @@ app.delete('/api/messages/:id', (req, res) => {
   res.json({ success: true, id });
 });
 
-// 4. Universal Webhook Endpoint (Accepts messages from any phone app: MacroDroid, Tasker, SMS Forwarder, etc.)
+// 4. Universal Webhook Endpoint (Supports POST, GET, PUT and JSON, urlencoded, plain text, or query parameters)
 app.all(['/api/messages', '/api/webhook/jeeb', '/api/webhook/sms', '/api/webhook'], (req, res) => {
   try {
     const body = req.body;
+    const query = req.query as Record<string, any>;
+    
     let sender = "رسالة هاتف";
     let text = "";
 
     if (typeof body === 'string') {
       text = body;
-    } else if (body && typeof body === 'object') {
+    } else if (body && typeof body === 'object' && Object.keys(body).length > 0) {
       sender = body.sender || body.from || body.title || body.address || body.phone || body.notification_title || "محفظة جيب";
       text = body.text || body.body || body.message || body.content || body.extra_text || body.notification_text || "";
 
-      // If user passed amount directly in test payload
       if (!text && body.amount) {
         text = `تم استلام مبلغ ${body.amount} ${body.currency || 'ر.ي'} من ${body.senderName || sender}.`;
       }
+    } else if (query && (query.text || query.body || query.message)) {
+      sender = query.sender || query.from || query.title || "محفظة جيب";
+      text = query.text || query.body || query.message || "";
     }
 
     if (!text.trim()) {
-      text = JSON.stringify(body || "رسالة واردة فارغة");
+      text = typeof body === 'object' ? JSON.stringify(body) : (body || "رسالة واردة");
     }
 
     const details = parseMessageDetails(text, sender);
@@ -285,7 +365,10 @@ async function startServer() {
   if (isDev) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false
+      },
       appType: 'spa'
     });
     app.use(vite.middlewares);
